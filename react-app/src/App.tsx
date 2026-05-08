@@ -5,6 +5,7 @@ import {
   ImagePlus,
   Loader2,
   Moon,
+  RefreshCw,
   Scan,
   Server,
   Sun,
@@ -28,6 +29,8 @@ type MatchResponse = {
 }
 
 const API_BASE = ""
+
+type HealthCheckResult = { ok: true } | { ok: false; detail: string }
 
 async function fetchJson<T>(
   path: string,
@@ -70,6 +73,7 @@ function App() {
   const [lastMatch, setLastMatch] = useState<MatchResponse | null>(null)
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [retestingServer, setRetestingServer] = useState(false)
 
   const toggleTheme = () => {
     const next = !isDark
@@ -77,14 +81,30 @@ function App() {
     document.documentElement.classList.toggle("dark", next)
   }
 
-  const checkHealth = useCallback(async () => {
+  const checkHealth = useCallback(async (): Promise<HealthCheckResult> => {
     const r = await fetchJson<{ status: string }>("/api/health")
-    setApiOnline(r.ok)
-    if (r.ok) {
-      const s = await fetchJson<{ loaded: boolean }>("/api/reference-status")
-      if (s.ok) setReferenceLoaded(s.data.loaded)
+    if (!r.ok) {
+      setApiOnline(false)
+      return { ok: false, detail: r.detail }
     }
+    setApiOnline(true)
+    const s = await fetchJson<{ loaded: boolean }>("/api/reference-status")
+    if (s.ok) setReferenceLoaded(s.data.loaded)
+    return { ok: true }
   }, [])
+
+  const retestServer = useCallback(async () => {
+    setRetestingServer(true)
+    setErrorMsg(null)
+    setStatusMsg(null)
+    const res = await checkHealth()
+    setRetestingServer(false)
+    if (res.ok) {
+      setStatusMsg("تم التحقق: الخادم يعمل.")
+    } else {
+      setErrorMsg(res.detail)
+    }
+  }, [checkHealth])
 
   useEffect(() => {
     void checkHealth()
@@ -240,6 +260,23 @@ function App() {
                   ? "الخادم متصل"
                   : "الخادم غير متصل"}
             </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-1.5"
+              title="إعادة اختبار الخادم"
+              aria-label="إعادة اختبار الخادم"
+              disabled={retestingServer}
+              onClick={() => void retestServer()}
+            >
+              {retestingServer ? (
+                <Loader2 className="size-4 animate-spin shrink-0" aria-hidden />
+              ) : (
+                <RefreshCw className="size-4 shrink-0" aria-hidden />
+              )}
+              <span className="hidden sm:inline">إعادة اختبار الخادم</span>
+            </Button>
             <Button variant="ghost" size="icon" type="button" onClick={toggleTheme}>
               {isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </Button>
@@ -298,10 +335,16 @@ function App() {
                 type="button"
                 variant="outline"
                 size="sm"
-                disabled={apiOnline === false}
-                onClick={() => void checkHealth()}
+                className="gap-2"
+                disabled={retestingServer}
+                onClick={() => void retestServer()}
               >
-                تحديث الاتصال بالخادم
+                {retestingServer ? (
+                  <Loader2 className="size-4 animate-spin shrink-0" aria-hidden />
+                ) : (
+                  <RefreshCw className="size-4 shrink-0" aria-hidden />
+                )}
+                إعادة اختبار الخادم
               </Button>
             </CardContent>
           </Card>
