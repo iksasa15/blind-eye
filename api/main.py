@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 import io
+import re
+from pathlib import Path
 from typing import Any
 
 import cv2
 import face_recognition
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
@@ -34,6 +36,36 @@ app.add_middleware(
 # بصمة الوجه المرجعي (مصفوفة طولها 128)
 known_encoding: np.ndarray | None = None
 DEFAULT_TOLERANCE = 0.55
+
+# مجلد حفظ صور الوجوه (بجانب مجلد api/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FACES_DIR = PROJECT_ROOT / "faces"
+
+
+def _ensure_faces_dir() -> None:
+    FACES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _sanitize_filename_part(raw: str, default: str) -> str:
+    s = (raw or "").strip()
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "", s)
+    s = "_".join(part for part in s.split() if part)
+    if not s:
+        return default
+    return s[:64]
+
+
+def _unique_jpeg_path(stem: str) -> Path:
+    _ensure_faces_dir()
+    first = FACES_DIR / f"{stem}.jpg"
+    if not first.exists():
+        return first
+    n = 2
+    while True:
+        p = FACES_DIR / f"{stem}_{n}.jpg"
+        if not p.exists():
+            return p
+        n += 1
 
 
 def _image_to_rgb_array(data: bytes) -> np.ndarray:
@@ -128,4 +160,52 @@ async def match_frame(
         "message": "نفس الشخص في الصورة المرجعية."
         if is_match
         else "لا يطابق الصورة المرجعية.",
+    }
+
+
+@app.post("/api/faces/save")
+async def save_captured_face(
+    file: UploadFile = File(...),
+    name: str = Form(..., min_length=1, max_length=80),
+    relation: str = Form("معروف", max_length=80),
+) -> dict[str, Any]:
+    """يلتقط الواجهة إطاراً ويحفظه في مجلد faces/ بصيغة الاسم_الصلة.jpg"""
+    name = name.strip()
+    relation = (relation or "").strip() or "معروف"
+    if not name:
+        raise HTTPException(status_code=400, detail="الاسم مطلوب.")
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="أرسل ملف صورة (jpg أو png).")
+
+    raw = await file.read()
+    try:
+        image = _image_to_rgb_array(raw)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"تعذر قراءة الصورة: {e}") from e
+
+    if _first_face_encoding(image) is None:
+        raise HTTPException(
+            status_code=422,
+            detail="لم يُعثر على وجه في الإطار. وقّف وجهك أمام الكاميرا وحاول مرة أخرى.",
+        )
+
+    part_name = _sanitize_filename_part(name, "شخص")
+    part_rel = _sanitize_filename_part(relation, "معروف")
+    stem = f"{part_name}_{part_rel}"
+    out_path = _unique_jpeg_path(stem)
+
+    try:
+        Image.fromarray(image).save(out_path, format="JPEG", quality=92)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500, detail=f"تعذر حفظ الملف: {e}"
+        ) from e
+
+    rel = out_path.relative_to(PROJECT_ROOT)
+    return {
+        "ok": True,
+        "filename": out_path.name,
+        "saved_to": str(rel).replace("\\", "/"),
+        "message": f"تم الحفظ في المجلد: {rel.parent}",
     }

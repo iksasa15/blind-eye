@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import {
   Camera,
   CameraOff,
+  Download,
   ImagePlus,
   Loader2,
   Moon,
   RefreshCw,
+  Save,
   Scan,
   Server,
   Sun,
@@ -74,6 +76,10 @@ function App() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [retestingServer, setRetestingServer] = useState(false)
+  const [faceName, setFaceName] = useState("")
+  const [faceRelation, setFaceRelation] = useState("معروف")
+  const [saveFaceBusy, setSaveFaceBusy] = useState(false)
+  const [snapshotBusy, setSnapshotBusy] = useState(false)
 
   const toggleTheme = () => {
     const next = !isDark
@@ -166,24 +172,31 @@ function App() {
     setStatusMsg(r.data.message ?? "تم حفظ الصورة المرجعية.")
   }
 
+  const captureFrameToJpegBlob = useCallback(
+    async (quality = 0.82): Promise<Blob | null> => {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas || video.readyState < 2) return null
+
+      const w = video.videoWidth
+      const h = video.videoHeight
+      if (!w || !h) return null
+
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext("2d")
+      if (!ctx) return null
+      ctx.drawImage(video, 0, 0, w, h)
+
+      return await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", quality)
+      )
+    },
+    []
+  )
+
   const captureAndMatch = useCallback(async () => {
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    if (!video || !canvas || video.readyState < 2) return
-
-    const w = video.videoWidth
-    const h = video.videoHeight
-    if (!w || !h) return
-
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return
-    ctx.drawImage(video, 0, 0, w, h)
-
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/jpeg", 0.82)
-    )
+    const blob = await captureFrameToJpegBlob(0.82)
     if (!blob) return
 
     const fd = new FormData()
@@ -198,7 +211,80 @@ function App() {
     }
     setLastMatch(r.data)
     setErrorMsg(null)
-  }, [tolerance])
+  }, [tolerance, captureFrameToJpegBlob])
+
+  const saveCaptureToFaces = async () => {
+    if (!cameraOn) {
+      setErrorMsg("شغّل الكاميرا أولاً.")
+      return
+    }
+    const name = faceName.trim()
+    if (!name) {
+      setErrorMsg("اكتب الاسم قبل الحفظ (يُستخدم في اسم الملف).")
+      return
+    }
+    setSaveFaceBusy(true)
+    setErrorMsg(null)
+    setStatusMsg(null)
+
+    const blob = await captureFrameToJpegBlob(0.92)
+    if (!blob) {
+      setSaveFaceBusy(false)
+      setErrorMsg("تعذر التقاط الإطار. تأكد أن الكاميرا تعرض صورة.")
+      return
+    }
+
+    const fd = new FormData()
+    fd.append("file", blob, "capture.jpg")
+    fd.append("name", name)
+    fd.append("relation", faceRelation.trim() || "معروف")
+
+    const r = await fetchJson<{
+      ok?: boolean
+      filename?: string
+      saved_to?: string
+      message?: string
+    }>("/api/faces/save", { method: "POST", body: fd })
+
+    setSaveFaceBusy(false)
+    if (!r.ok) {
+      setErrorMsg(r.detail)
+      return
+    }
+    setStatusMsg(
+      r.data.message
+        ? `${r.data.message} — ${r.data.filename ?? ""}`
+        : `تم الحفظ: ${r.data.saved_to ?? r.data.filename ?? ""}`
+    )
+  }
+
+  const downloadSnapshotFromBrowser = async () => {
+    if (!cameraOn) {
+      setErrorMsg("شغّل الكاميرا أولاً.")
+      return
+    }
+    setSnapshotBusy(true)
+    setErrorMsg(null)
+    const blob = await captureFrameToJpegBlob(0.95)
+    setSnapshotBusy(false)
+    if (!blob) {
+      setErrorMsg("تعذر التقاط الصورة من المتصفح.")
+      return
+    }
+    const url = URL.createObjectURL(blob)
+    const stamp = new Date()
+      .toISOString()
+      .replaceAll(":", "-")
+      .replace("T", "_")
+      .slice(0, 19)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `webcam-capture_${stamp}.jpg`
+    a.rel = "noopener"
+    a.click()
+    URL.revokeObjectURL(url)
+    setStatusMsg("تم تحميل لقطة من الكاميرا كملف JPG (مجلد التنزيلات في المتصفح).")
+  }
 
   useEffect(() => {
     if (!scanning || !cameraOn) return
@@ -434,6 +520,77 @@ function App() {
               )}
             </div>
             <canvas ref={canvasRef} className="hidden" />
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between rounded-lg border bg-muted/20 p-3">
+              <p className="text-sm text-muted-foreground">
+                التقاط صورة من الكاميرا وتنزيلها على جهازك (يعمل بدون خادم).
+              </p>
+              <Button
+                type="button"
+                className="gap-2 shrink-0"
+                disabled={!cameraOn || snapshotBusy}
+                onClick={() => void downloadSnapshotFromBrowser()}
+              >
+                {snapshotBusy ? (
+                  <Loader2 className="size-4 animate-spin shrink-0" aria-hidden />
+                ) : (
+                  <Download className="size-4 shrink-0" aria-hidden />
+                )}
+                التقاط صورة من المتصفح
+              </Button>
+            </div>
+
+            <div className="rounded-lg border bg-card p-4 space-y-3">
+              <div>
+                <h3 className="font-semibold flex items-center gap-2">
+                  <Save className="size-4" />
+                  حفظ لقطة في مجلد faces
+                </h3>
+                <p className="text-xs text-muted-foreground mt-1">
+                  يُحفظ الملف على جهازك داخل{" "}
+                  <code className="rounded bg-muted px-1">project test/faces/</code>{" "}
+                  بصيغة الاسم_الصلة.jpg (متوافق مع <code className="rounded bg-muted px-1">database_loader.py</code>).
+                </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="space-y-1">
+                  <span className="text-sm font-medium">الاسم</span>
+                  <input
+                    type="text"
+                    value={faceName}
+                    onChange={(e) => setFaceName(e.target.value)}
+                    placeholder="مثال: أحمد"
+                    disabled={!cameraOn || saveFaceBusy}
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-sm font-medium">صلة القرابة / وصف</span>
+                  <input
+                    type="text"
+                    value={faceRelation}
+                    onChange={(e) => setFaceRelation(e.target.value)}
+                    placeholder="مثال: أخ"
+                    disabled={!cameraOn || saveFaceBusy}
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  />
+                </label>
+              </div>
+              <Button
+                type="button"
+                variant="secondary"
+                className="gap-2"
+                disabled={!cameraOn || saveFaceBusy || apiOnline === false}
+                onClick={() => void saveCaptureToFaces()}
+              >
+                {saveFaceBusy ? (
+                  <Loader2 className="size-4 animate-spin shrink-0" aria-hidden />
+                ) : (
+                  <Save className="size-4 shrink-0" aria-hidden />
+                )}
+                التقاط صورة وحفظها في faces
+              </Button>
+            </div>
 
             {lastMatch && (
               <div
