@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Camera,
   CameraOff,
@@ -15,6 +15,7 @@ import {
   UserX,
 } from "lucide-react"
 
+import { useClientFaceTrack } from "@/hooks/useClientFaceTrack"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -24,10 +25,96 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 
+type FaceBox = {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
+type IdentityInfo = {
+  status: string
+  label_ar: string
+  name?: string | null
+  relation?: string | null
+  distance?: number | null
+  source_file?: string
+}
+
 type MatchResponse = {
   match: boolean
   distance: number | null
   message: string
+  face_box?: FaceBox | null
+  identity?: IdentityInfo | null
+}
+
+type FaceOverlayVariant = "detect" | "match-yes" | "match-no"
+
+/** يحوّل إحداثيات الوجه من بكسل الفيديو إلى موضع فوق عنصر المعاينة (object-contain + انعكاس السيلفي). */
+function faceBoxToOverlayStyle(
+  box: FaceBox,
+  video: HTMLVideoElement,
+  container: HTMLDivElement,
+  mirrorPreview: boolean,
+  variant: FaceOverlayVariant
+): React.CSSProperties {
+  const vw = video.videoWidth
+  const vh = video.videoHeight
+  if (!vw || !vh) return { display: "none" }
+
+  const cw = container.clientWidth
+  const ch = container.clientHeight
+  const vr = vw / vh
+  const cr = cw / ch
+  let dispW: number
+  let dispH: number
+  let offX: number
+  let offY: number
+  if (cr > vr) {
+    dispH = ch
+    dispW = dispH * vr
+    offX = (cw - dispW) / 2
+    offY = 0
+  } else {
+    dispW = cw
+    dispH = dispW / vr
+    offX = 0
+    offY = (ch - dispH) / 2
+  }
+
+  let left = box.left
+  let right = box.right
+  if (mirrorPreview) {
+    left = vw - box.right
+    right = vw - box.left
+  }
+
+  const x = offX + (left / vw) * dispW
+  const y = offY + (box.top / vh) * dispH
+  const w = ((right - left) / vw) * dispW
+  const h = ((box.bottom - box.top) / vh) * dispH
+
+  const borderColor =
+    variant === "detect"
+      ? "rgb(56 189 248)"
+      : variant === "match-yes"
+        ? "rgb(34 197 94)"
+        : "rgb(245 158 11)"
+  const zIndex = variant === "detect" ? 8 : 12
+
+  return {
+    position: "absolute",
+    left: Math.round(x),
+    top: Math.round(y),
+    width: Math.max(1, Math.round(w)),
+    height: Math.max(1, Math.round(h)),
+    border: `3px solid ${borderColor}`,
+    borderRadius: 12,
+    boxShadow: "0 0 0 1px rgba(0,0,0,0.35)",
+    pointerEvents: "none",
+    zIndex,
+  }
 }
 
 const API_BASE = ""
@@ -61,6 +148,7 @@ async function fetchJson<T>(
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const videoWrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -71,7 +159,7 @@ function App() {
   const [uploadBusy, setUploadBusy] = useState(false)
   const [cameraOn, setCameraOn] = useState(false)
   const [scanning, setScanning] = useState(false)
-  const [tolerance, setTolerance] = useState(0.55)
+  const [tolerance, setTolerance] = useState(0.58)
   const [lastMatch, setLastMatch] = useState<MatchResponse | null>(null)
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -80,6 +168,16 @@ function App() {
   const [faceRelation, setFaceRelation] = useState("معروف")
   const [saveFaceBusy, setSaveFaceBusy] = useState(false)
   const [snapshotBusy, setSnapshotBusy] = useState(false)
+  const [layoutTick, setLayoutTick] = useState(0)
+  const [liveFaceBoxes, setLiveFaceBoxes] = useState<FaceBox[]>([])
+  const [liveIdentity, setLiveIdentity] = useState<IdentityInfo | null>(null)
+  const liveDetectTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const clientFaceTrack = useClientFaceTrack(videoRef, cameraOn && !scanning)
+  const useClientBoxes = !clientFaceTrack.failed && clientFaceTrack.ready
+  const overlayFaceBoxes: FaceBox[] = useClientBoxes
+    ? clientFaceTrack.boxes
+    : liveFaceBoxes
 
   const toggleTheme = () => {
     const next = !isDark
@@ -116,12 +214,42 @@ function App() {
     void checkHealth()
   }, [checkHealth])
 
+  useEffect(() => {
+    const wrap = videoWrapRef.current
+    const video = videoRef.current
+    if (!cameraOn || !wrap || !video) return
+
+    const bump = () => setLayoutTick((t) => t + 1)
+    const ro = new ResizeObserver(bump)
+    ro.observe(wrap)
+    video.addEventListener("loadedmetadata", bump)
+    window.addEventListener("resize", bump)
+    bump()
+
+    return () => {
+      ro.disconnect()
+      video.removeEventListener("loadedmetadata", bump)
+      window.removeEventListener("resize", bump)
+    }
+  }, [cameraOn])
+
+  useEffect(() => {
+    setLayoutTick((t) => t + 1)
+  }, [lastMatch])
+
   const stopCamera = useCallback(() => {
     if (scanTimerRef.current) {
       clearInterval(scanTimerRef.current)
       scanTimerRef.current = null
     }
+    if (liveDetectTimerRef.current) {
+      clearInterval(liveDetectTimerRef.current)
+      liveDetectTimerRef.current = null
+    }
     setScanning(false)
+    setLastMatch(null)
+    setLiveFaceBoxes([])
+    setLiveIdentity(null)
     streamRef.current?.getTracks().forEach((t) => t.stop())
     streamRef.current = null
     if (videoRef.current) videoRef.current.srcObject = null
@@ -194,6 +322,62 @@ function App() {
     },
     []
   )
+
+  useEffect(() => {
+    if (liveDetectTimerRef.current) {
+      clearInterval(liveDetectTimerRef.current)
+      liveDetectTimerRef.current = null
+    }
+
+    if (!cameraOn || apiOnline !== true) {
+      setLiveFaceBoxes([])
+      setLiveIdentity(null)
+      return
+    }
+
+    if (scanning) {
+      setLiveFaceBoxes([])
+      setLiveIdentity(null)
+      return
+    }
+
+    let cancelled = false
+
+    const tick = async () => {
+      const blob = await captureFrameToJpegBlob(0.72)
+      if (!blob || cancelled) return
+      const fd = new FormData()
+      fd.append("file", blob, "frame.jpg")
+      const r = await fetchJson<{
+        faces?: FaceBox[]
+        identity?: IdentityInfo | null
+      }>("/api/analyze-frame", {
+        method: "POST",
+        body: fd,
+      })
+      if (cancelled) return
+      if (r.ok) {
+        setLiveFaceBoxes(Array.isArray(r.data.faces) ? r.data.faces : [])
+        setLiveIdentity(r.data.identity ?? null)
+      } else {
+        setLiveFaceBoxes([])
+        setLiveIdentity(null)
+      }
+    }
+
+    void tick()
+    liveDetectTimerRef.current = setInterval(() => {
+      void tick()
+    }, 900)
+
+    return () => {
+      cancelled = true
+      if (liveDetectTimerRef.current) {
+        clearInterval(liveDetectTimerRef.current)
+        liveDetectTimerRef.current = null
+      }
+    }
+  }, [cameraOn, apiOnline, scanning, captureFrameToJpegBlob])
 
   const captureAndMatch = useCallback(async () => {
     const blob = await captureFrameToJpegBlob(0.82)
@@ -312,6 +496,15 @@ function App() {
     setScanning((s) => !s)
     setErrorMsg(null)
   }
+
+  const matchOutlineStyle = useMemo(() => {
+    const v = videoRef.current
+    const wrap = videoWrapRef.current
+    const b = lastMatch?.face_box
+    if (!cameraOn || !scanning || !v || !wrap || !b) return null
+    const variant = lastMatch.match ? "match-yes" : "match-no"
+    return faceBoxToOverlayStyle(b, v, wrap, true, variant)
+  }, [cameraOn, scanning, lastMatch, layoutTick])
 
   return (
     <div className="min-h-screen bg-background" dir="rtl">
@@ -486,14 +679,15 @@ function App() {
                   id="tol"
                   type="range"
                   min={0.35}
-                  max={0.7}
+                  max={0.72}
                   step={0.01}
                   value={tolerance}
                   onChange={(e) => setTolerance(Number(e.target.value))}
                   className="w-full accent-primary"
                 />
                 <p className="text-xs text-muted-foreground">
-                  أقل = أكثر صرامة (أقل قبول للتشابه).
+                  أقل = أكثر صرامة. إذا لا يتعرّف عليك، ارفع الحد تدريجياً (مثلاً 0.62) أو
+                  أعد رفع صورة مرجعية قريبة من زاوية الكاميرا وإضاءة جيدة.
                 </p>
               </div>
             </CardContent>
@@ -503,23 +697,67 @@ function App() {
         <Card className="overflow-hidden">
           <CardHeader className="pb-2">
             <CardTitle className="text-lg">معاينة الكاميرا</CardTitle>
+            <CardDescription>
+              المستطيل الأزرق يُحدَّث من المتصفح إطاراً بإطار (MediaPipe) ليتبع حركتك بسلاسة.
+              النص أسفله يأتي من الخادم كل ثانية تقريباً (قائمة{" "}
+              <code className="rounded bg-muted px-1">faces/</code> + صورة المرجع).
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="relative rounded-lg border bg-muted/30 overflow-hidden aspect-video grid place-items-center">
+            <div
+              ref={videoWrapRef}
+              className="relative rounded-lg border bg-muted/30 overflow-hidden aspect-video grid place-items-center"
+            >
               <video
                 ref={videoRef}
-                className="max-h-[420px] w-full object-contain mirror"
+                className="relative z-0 max-h-[420px] w-full h-full object-contain mirror"
                 playsInline
                 muted
                 autoPlay
               />
+              {!scanning &&
+                cameraOn &&
+                overlayFaceBoxes.map((box, i) => {
+                  const v = videoRef.current
+                  const wrap = videoWrapRef.current
+                  if (!v || !wrap) return null
+                  return (
+                    <div
+                      key={`${box.left}-${box.top}-${i}-${layoutTick}-${useClientBoxes ? "c" : "s"}`}
+                      className="pointer-events-none"
+                      style={faceBoxToOverlayStyle(box, v, wrap, true, "detect")}
+                      aria-hidden
+                    />
+                  )
+                })}
+              {matchOutlineStyle ? (
+                <div
+                  className="pointer-events-none"
+                  style={matchOutlineStyle}
+                  aria-hidden
+                />
+              ) : null}
               {!cameraOn && (
-                <span className="absolute text-sm text-muted-foreground">
+                <span className="absolute z-[5] text-sm text-muted-foreground">
                   الكاميرا متوقفة
                 </span>
               )}
             </div>
             <canvas ref={canvasRef} className="hidden" />
+
+            {cameraOn && !scanning && liveIdentity && (
+              <div
+                className="rounded-lg border bg-muted/40 px-4 py-3 text-center"
+                role="status"
+              >
+                <p className="text-base font-semibold leading-snug">{liveIdentity.label_ar}</p>
+                {liveIdentity.distance != null && (
+                  <p className="text-xs text-muted-foreground font-mono mt-1">
+                    مقياس المسافة: {liveIdentity.distance} (أقل = أشبه بالاسم المعروض)
+                  </p>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between rounded-lg border bg-muted/20 p-3">
               <p className="text-sm text-muted-foreground">
@@ -613,6 +851,11 @@ function App() {
                   {lastMatch.distance != null && (
                     <p className="text-xs mt-1 font-mono">
                       المسافة: {lastMatch.distance}
+                    </p>
+                  )}
+                  {lastMatch.identity?.label_ar && (
+                    <p className="text-sm font-medium mt-2 pt-2 border-t border-border/60">
+                      من هو؟ {lastMatch.identity.label_ar}
                     </p>
                   )}
                 </div>
